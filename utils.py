@@ -1,6 +1,5 @@
 import pandas as pd
 import numpy as np
-import ta
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from config import TRADING_MODE  # добавляем импорт режима
 
@@ -204,4 +203,5 @@ def format_price(price: float, symbol: str = "USDT") -> str:
     elif price >= 1:
         return f"{price:,.2f} {symbol}"
     else:
+
         return f"{price:.6f} {symbol}"
