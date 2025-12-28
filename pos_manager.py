@@ -523,93 +523,234 @@ def check_position(symbol: str, price: float):
 
 def close_position(symbol: str, exit_price: float, exit_reason=None):
     """Закрытие позиции"""
+    print(f"\n{'='*50}")
+    print(f"🚨 ЗАКРЫТИЕ ПОЗИЦИИ {symbol}")
+    print(f"{'='*50}")
+    
     # Инициализируем клиент если нужно
     if TRADING_MODE == 'real':
         if not init_binance_client():
             print(f"❌ Не удалось инициализировать клиент для закрытия позиции")
             return False
     
-    if TRADING_MODE == 'dryrun':
-        # DRY RUN - виртуальное закрытие
-        pos = get_open_position(symbol)
-        if not pos:
-            return False
-
-        qty = pos["qty"]
-        side = pos["side"]
-        entry = pos["entry"]
-
-        # Расчёт PnL
-        if side == "BUY":  # Лонг
-            pnl = (exit_price - entry) * qty
-        elif side in ("SELL", "SHORT"):  # Шорт
-            pnl = (entry - exit_price) * qty
-        else:
-            pnl = 0
-
-        # Обновляем exit_reason и зануляем TP/SL
-        pos["exit_reason"] = exit_reason or "MANUAL"
-        pos["tp"] = None
-        pos["sl"] = None
-
-        # Логируем закрытие
-        log_position(
-            action="CLOSE",
-            symbol=symbol,
-            side=side,
-            price=exit_price,
-            qty=qty,
-            pnl=pnl,
-            exit_reason=pos["exit_reason"]
-        )
-
-        # Удаляем из кэша
-        user_data_cache["positions"].pop(symbol, None)
-        return True
-    else:
-        # РЕАЛЬНАЯ ТОРГОВЛЯ - закрытие на Binance
-        try:
-            # Получаем текущую позицию
-            positions = get_open_positions()
-            pos = None
-            for p in positions:
-                if p.get('symbol') == symbol:
-                    pos = p
-                    break
-            
+    try:
+        if TRADING_MODE == 'dryrun':
+            # DRY RUN - виртуальное закрытие
+            pos = get_open_position(symbol)
             if not pos:
-                print(f"❌ Позиция {symbol} не найдена для закрытия")
+                print(f"❌ Позиция {symbol} не найдена в сухом режиме")
                 return False
-            
-            # Определяем сторону для закрытия (противоположная открытой)
-            close_side = "SELL" if pos["side"] == "BUY" else "BUY"
+
             qty = pos["qty"]
-            
-            print(f"🚨 РЕАЛЬНОЕ ЗАКРЫТИЕ: {close_side} {qty:.4f} {symbol}")
-            
-            # Размещаем ордер на закрытие
-            order = global_client.place_order(
-                side=close_side,
-                quantity=qty,
-                symbol=symbol,
-                order_type='MARKET'
-            )
-            
+            side = pos["side"]
+            entry = pos["entry"]
+
+            # Расчёт PnL
+            if side == "BUY":  # Лонг
+                pnl = (exit_price - entry) * qty
+            elif side in ("SELL", "SHORT"):  # Шорт
+                pnl = (entry - exit_price) * qty
+            else:
+                pnl = 0
+
+            print(f"📊 Параметры закрытия (сухой режим):")
+            print(f"   Сторона: {side}")
+            print(f"   Количество: {qty}")
+            print(f"   Цена входа: {entry}")
+            print(f"   Цена выхода: {exit_price}")
+            print(f"   PnL: {pnl:.2f}")
+            print(f"   Причина: {exit_reason}")
+
+            # Обновляем exit_reason и зануляем TP/SL
+            pos["exit_reason"] = exit_reason or "MANUAL"
+            pos["tp"] = None
+            pos["sl"] = None
+
             # Логируем закрытие
-            pnl = pos.get('unrealized_pnl', 0)
             log_position(
                 action="CLOSE",
                 symbol=symbol,
-                side=pos["side"],
+                side=side,
                 price=exit_price,
                 qty=qty,
                 pnl=pnl,
-                exit_reason=exit_reason or "REAL_TRADE_CLOSE"
+                exit_reason=pos["exit_reason"]
             )
-            
-            print(f"✅ Реальная позиция закрыта: {symbol}")
+
+            # Удаляем из кэша
+            user_data_cache["positions"].pop(symbol, None)
+            print(f"✅ Позиция {symbol} закрыта в сухом режиме")
             return True
             
-        except Exception as e:
-            print(f"❌ Ошибка закрытия реальной позиции: {e}")
-            return False
+        else:
+            # РЕАЛЬНАЯ ТОРГОВЛЯ - закрытие на Binance
+            print(f"🔴 РЕАЛЬНОЕ ЗАКРЫТИЕ ПОЗИЦИИ")
+            
+            # 1. Получаем текущую позицию с Binance
+            print(f"🔍 Получаю позицию {symbol} с Binance...")
+            positions = global_client.get_positions()
+            
+            target_pos = None
+            for pos in positions:
+                if pos.get('symbol') == symbol:
+                    target_pos = pos
+                    break
+            
+            if not target_pos:
+                print(f"❌ Позиция {symbol} не найдена на Binance")
+                # Проверяем в кэше на случай если Binance API не отдает
+                pos = get_open_position(symbol)
+                if pos:
+                    print(f"⚠️  Позиция найдена в кэше, но не на Binance")
+                    target_pos = pos
+                else:
+                    return False
+            
+            # 2. Получаем параметры позиции
+            side = target_pos.get("side", "BUY")
+            qty = target_pos.get("quantity", target_pos.get("qty", 0))
+            
+            if qty <= 0:
+                print(f"⚠️  Количество позиции {symbol} равно или меньше 0: {qty}")
+                return False
+            
+            # Определяем сторону для закрытия (противоположная открытой)
+            close_side = "SELL" if side == "BUY" else "BUY"
+            
+            print(f"📋 Параметры позиции:")
+            print(f"   Символ: {symbol}")
+            print(f"   Открытая сторона: {side}")
+            print(f"   Сторона закрытия: {close_side}")
+            print(f"   Количество: {qty}")
+            print(f"   Режим: РЕАЛЬНЫЙ")
+            print(f"   Причина закрытия: {exit_reason}")
+            
+            # 3. Форматируем количество для API
+            # Получаем step_size для символа
+            symbol_info = global_client.get_symbol_info(symbol)
+            step_size = symbol_info.get('step_size', 1.0) if symbol_info else 1.0
+            
+            # Определяем точность
+            step_str = str(step_size)
+            if '.' in step_str:
+                precision = len(step_str.rstrip('0').split('.')[1])
+            else:
+                precision = 0
+            
+            # Форматируем количество
+            if precision == 0:
+                qty_str = str(int(qty))
+            else:
+                qty_str = format(qty, f'.{precision}f')
+            
+            print(f"🔢 Количество для API ({precision} знаков): {qty_str}")
+            
+            # 4. Закрываем позицию на Binance
+            print(f"🚀 Отправляю ордер на закрытие...")
+            
+            try:
+                # Используем close_position из binance_client
+                order = global_client.close_position(symbol, side, qty_str)
+                
+                if not order or 'orderId' not in order:
+                    print(f"❌ Ошибка: не получен ID ордера")
+                    # Пробуем использовать place_order с reduceOnly
+                    print(f"⚠️  Пробую альтернативный метод закрытия...")
+                    order = global_client.client.futures_create_order(
+                        symbol=symbol,
+                        side=close_side,
+                        type='MARKET',
+                        quantity=qty_str,
+                        reduceOnly=True
+                    )
+                
+                print(f"✅ Ордер на закрытие размещен!")
+                print(f"📋 ID ордера: {order.get('orderId', 'N/A')}")
+                print(f"📊 Статус: {order.get('status', 'UNKNOWN')}")
+                print(f"💰 Исполнено: {order.get('executedQty', '0')}")
+                
+                # 5. Логируем закрытие
+                pnl = target_pos.get('unrealized_pnl', 0)
+                log_position(
+                    action="CLOSE",
+                    symbol=symbol,
+                    side=side,
+                    price=exit_price,
+                    qty=qty,
+                    pnl=pnl,
+                    exit_reason=exit_reason or "REAL_TRADE_CLOSE"
+                )
+                
+                # 6. Ждем и проверяем закрытие
+                time.sleep(3)
+                
+                # Проверяем, закрылась ли позиция
+                positions_after = global_client.get_positions()
+                still_open = False
+                
+                for pos in positions_after:
+                    if pos.get('symbol') == symbol:
+                        if float(pos.get('quantity', 0)) > 0:
+                            still_open = True
+                            print(f"⚠️  Позиция {symbol} все еще открыта!")
+                            print(f"   Остаток: {pos.get('quantity')}")
+                        break
+                
+                if not still_open:
+                    print(f"✅✅✅ ПОЗИЦИЯ {symbol} УСПЕШНО ЗАКРЫТА НА BINANCE!")
+                    
+                    # Удаляем из кэша
+                    if "positions" in user_data_cache and symbol in user_data_cache["positions"]:
+                        del user_data_cache["positions"][symbol]
+                        print(f"🗑️  Позиция удалена из кэша")
+                
+                # 7. Отправляем уведомление в Telegram
+                try:
+                    from telegram_bot import send_trade_closed
+                    
+                    trade_data = {
+                        'symbol': symbol,
+                        'side': side,
+                        'qty': qty,
+                        'entry_price': target_pos.get('entry', exit_price),
+                        'exit_price': exit_price,
+                        'pnl': pnl,
+                        'order_id': order.get('orderId', 'N/A'),
+                        'reason': exit_reason or "Закрытие позиции",
+                        'mode': 'REAL'
+                    }
+                    
+                    send_trade_closed(trade_data)
+                    print(f"📤 Уведомление о закрытии отправлено в Telegram")
+                    
+                except Exception as tg_error:
+                    print(f"⚠️  Ошибка отправки в Telegram: {tg_error}")
+                
+                return True
+                
+            except Exception as order_error:
+                print(f"❌ Ошибка размещения ордера: {order_error}")
+                
+                # Пробуем альтернативный метод через futures_create_order
+                try:
+                    print(f"🔄 Пробую альтернативный метод закрытия...")
+                    order = global_client.client.futures_create_order(
+                        symbol=symbol,
+                        side=close_side,
+                        type='MARKET',
+                        quantity=qty_str
+                    )
+                    print(f"✅ Альтернативный ордер размещен: {order.get('orderId')}")
+                    return True
+                except Exception as alt_error:
+                    print(f"❌ Альтернативный метод тоже не сработал: {alt_error}")
+                    return False
+                
+    except Exception as e:
+        print(f"❌ КРИТИЧЕСКАЯ ОШИБКА в close_position: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+    
+    finally:
+        print(f"{'='*50}\n")
