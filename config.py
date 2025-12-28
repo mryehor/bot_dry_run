@@ -40,9 +40,10 @@ USE_BREAKOUT = True
 
 # Trading / risk
 INITIAL_CASH = 500.0
-LEVERAGE = 5
+LEVERAGE = 10
 RISK_FRACTION = 0.1  # 10% of equity per trade
 
 # Logging / files
 LOG_FILE = "trades_real.log"
 POSITIONS_LOG_FILE = "positions_log.json"
+
