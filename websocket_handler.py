@@ -73,9 +73,9 @@ async def handle_kline(msg):
 
         # --- сигналы по индикаторам ---
         if len(df) > 2:
-            lower = bol_l(df["Close"])[-1]
-            upper = bol_h(df["Close"])[-1]
-            rsi_val = rsi(df["Close"])[-1]
+            lower = bol_l(df["Close"]).iloc[-1]
+            upper = bol_h(df["Close"]).iloc[-1]
+            rsi_val = rsi(df["Close"]).iloc[-1]
             if df["Close"].iloc[-2] > lower and df["Close"].iloc[-1] < lower and rsi_val < 30:
                 signal = "BUY"
             elif df["Close"].iloc[-2] < upper and df["Close"].iloc[-1] > upper and rsi_val > 70:
@@ -278,3 +278,4 @@ async def get_liquid_tickers(top_n=10, min_price=0.1, min_volume=1_000_000, max_
         return top_symbols
     finally:
         await client.close_connection()
+
