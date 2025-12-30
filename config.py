@@ -43,7 +43,23 @@ INITIAL_CASH = 500.0
 LEVERAGE = 10
 RISK_FRACTION = 0.1  # 10% of equity per trade
 
+# Стратегия TP/SL
+TP_STRATEGY = "rr"  # "fixed", "rr", "atr"
+
+# Для fixed:
+TP_PERCENT = 0.02  # 2%
+SL_PERCENT = 0.01  # 1%
+TRAILING_STOP_PERCENT = 0.005 # 0.5%
+
+# Для risk-reward:
+RR_RATIO = 2.0     # 1:2
+RISK_PERCENT = 0.01  # 1% риск
+
+# Для ATR:
+ATR_TP_MULTIPLIER = 2.0
+ATR_SL_MULTIPLIER = 1.0
+
+
 # Logging / files
 LOG_FILE = "trades_real.log"
 POSITIONS_LOG_FILE = "positions_log.json"
-
