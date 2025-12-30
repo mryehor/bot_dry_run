@@ -119,6 +119,90 @@ def optimize_and_select_top_ws(symbols):
     top5 = results[:5]
     print("[INFO] Top5 монет:", top5)
     return top5
+    
+# ========== ЦИКЛ МОНИТОРИНГА TP/SL ==========
+async def tp_sl_monitor_loop():
+    """Цикл мониторинга и закрытия позиций по TP/SL"""
+    print("🎯 Запуск цикла мониторинга TP/SL...")
+    
+    from pos_manager import auto_close_positions
+    from telegram_bot import send_to_me
+    
+    check_interval = 10  # Проверять каждые 10 секунд
+    last_report_time = time.time()
+    report_interval = 300  # Отчет каждые 5 минут
+    
+    while True:
+        try:
+            # Проверяем статус торговли
+            from telegram_bot import should_trade
+            if not should_trade():
+                await asyncio.sleep(30)
+                continue
+            
+            # Автоматически закрываем позиции по TP/SL
+            closed_positions = auto_close_positions()
+            
+            # Отправляем уведомления о закрытых позициях
+            if closed_positions:
+                for pos in closed_positions:
+                    msg = f"""
+✅ ПОЗИЦИЯ ЗАКРЫТА АВТОМАТИЧЕСКИ:
+
+Символ: {pos['symbol']}
+Причина: {pos['reason']}
+PnL: {pos['pnl']:+.2f} ({pos['pnl_percent']:+.2f}%)
+Время: {datetime.now().strftime('%H:%M:%S')}
+"""
+                    try:
+                        send_to_me(msg)
+                    except:
+                        print(f"⚠️  Не удалось отправить уведомление о закрытии")
+            
+            # Периодический отчет
+            current_time = time.time()
+            if current_time - last_report_time > report_interval:
+                from data_store import user_data_cache
+                positions_dict = user_data_cache.get("positions", {})
+                open_positions = [p for p in positions_dict.values() if p.get('status') == 'OPEN']
+                
+                if open_positions:
+                    report = f"📊 ОТКРЫТЫЕ ПОЗИЦИИ ({len(open_positions)}):\n"
+                    
+                    for pos in open_positions[:5]:  # Первые 5 позиций
+                        side = pos.get('side', 'BUY')
+                        entry = pos.get('entry', 0)
+                        current = pos.get('current_price', entry)
+                        tp = pos.get('tp_price', 0)
+                        sl = pos.get('sl_price', 0)
+                        pnl = pos.get('unrealized_pnl', 0)
+                        
+                        # Расчет расстояния до TP/SL в %
+                        if side == 'BUY':
+                            to_tp = ((tp - current) / current) * 100 if tp > 0 else 0
+                            to_sl = ((current - sl) / current) * 100 if sl > 0 else 0
+                        else:
+                            to_tp = ((current - tp) / current) * 100 if tp > 0 else 0
+                            to_sl = ((sl - current) / current) * 100 if sl > 0 else 0
+                        
+                        report += f"   {pos['symbol']} {side}: "
+                        report += f"PnL={pnl:+.2f}, "
+                        report += f"До TP: {to_tp:.1f}%, "
+                        report += f"До SL: {to_sl:.1f}%\n"
+                    
+                    try:
+                        send_to_me(report)
+                    except:
+                        print("⚠️  Не удалось отправить отчет")
+                
+                last_report_time = current_time
+            
+            await asyncio.sleep(check_interval)
+            
+        except Exception as e:
+            print(f"❌ Ошибка в цикле мониторинга TP/SL: {e}")
+            await asyncio.sleep(30)
+
 
 # ========== ТОРГОВЫЙ ЦИКЛ ==========
 async def trade_symbol_loop(symbol):
@@ -790,12 +874,15 @@ async def main_async():
     # Запуск цикла здоровья системы
     print("❤️  Запуск цикла проверки здоровья...")
     health_task = asyncio.create_task(system_health_loop())
+
+    print("🎯 Запуск цикла мониторинга TP/SL...")
+    tp_sl_task = asyncio.create_task(tp_sl_monitor_loop())
     
     print(f"\n✅ Бот успешно запущен! Торговля: {'АКТИВНА' if not get_trading_status()['paused'] else 'НА ПАУЗЕ'}")
     print("   Используйте Telegram для управления ботом")
     
     # Ожидание завершения всех задач
-    await asyncio.gather(*trade_tasks, monitor_task, health_task)
+    await asyncio.gather(*trade_tasks, monitor_task, health_task, tp_sl_task)
 
 # ========== ЗАПУСК ПАНЕЛИ УПРАВЛЕНИЯ ==========
 def start_control_panel():
@@ -855,4 +942,5 @@ if __name__ == "__main__":
                 print(f"Достигнут лимит перезапусков ({max_restarts})")
                 sys.exit(1)
             
+
             time.sleep(RESTART_DELAY)
