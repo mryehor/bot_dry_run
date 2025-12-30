@@ -7,6 +7,82 @@ import time
 from typing import Dict, List, Optional, Any
 # Импортируем глобальный клиент
 from binance_client import binance_client as global_client
+from config import TP_STRATEGY, TP_PERCENT, SL_PERCENT, RR_RATIO, RISK_PERCENT, ATR_TP_MULTIPLIER, ATR_SL_MULTIPLIER, TRAILING_STOP_PERCENT
+import pandas as pd
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ TP/SL ==========
+
+def calculate_atr(df, period=14):
+    """Расчет Average True Range (ATR)"""
+    try:
+        high_low = df['High'] - df['Low']
+        high_close = abs(df['High'] - df['Close'].shift())
+        low_close = abs(df['Low'] - df['Close'].shift())
+        ranges = pd.concat([high_low, high_close, low_close], axis=1)
+        true_range = ranges.max(axis=1)
+        atr = true_range.rolling(window=period).mean().iloc[-1]
+        return atr
+    except:
+        return 0
+
+def calculate_tp_sl(entry_price, side, df=None):
+    """Умный расчет TP/SL в зависимости от стратегии"""
+    from config import (
+        TP_STRATEGY, TP_PERCENT, SL_PERCENT, 
+        RR_RATIO, RISK_PERCENT, 
+        ATR_TP_MULTIPLIER, ATR_SL_MULTIPLIER, ATR_PERIOD
+    )
+    
+    try:
+        if TP_STRATEGY == "atr" and df is not None:
+            # ATR-based стратегия
+            atr = calculate_atr(df, ATR_PERIOD)
+            
+            if atr > 0 and atr / entry_price > 0.001:  # ATR должен быть значимым
+                if side.upper() == 'BUY':
+                    tp_price = entry_price + (atr * ATR_TP_MULTIPLIER)
+                    sl_price = entry_price - (atr * ATR_SL_MULTIPLIER)
+                else:  # SELL
+                    tp_price = entry_price - (atr * ATR_TP_MULTIPLIER)
+                    sl_price = entry_price + (atr * ATR_SL_MULTIPLIER)
+                
+                tp_percent = abs((tp_price - entry_price) / entry_price)
+                sl_percent = abs((sl_price - entry_price) / entry_price)
+                
+                return tp_price, sl_price, tp_percent, sl_percent
+        
+        if TP_STRATEGY == "rr":
+            # Risk-Reward стратегия
+            if side.upper() == 'BUY':
+                sl_price = entry_price * (1 - RISK_PERCENT)
+                tp_price = entry_price + (entry_price - sl_price) * RR_RATIO
+            else:  # SELL
+                sl_price = entry_price * (1 + RISK_PERCENT)
+                tp_price = entry_price - (sl_price - entry_price) * RR_RATIO
+            
+            tp_percent = abs((tp_price - entry_price) / entry_price)
+            sl_percent = abs((sl_price - entry_price) / entry_price)
+            
+            return tp_price, sl_price, tp_percent, sl_percent
+        
+        # По умолчанию: fixed процент
+        if side.upper() == 'BUY':
+            tp_price = entry_price * (1 + TP_PERCENT)
+            sl_price = entry_price * (1 - SL_PERCENT)
+        else:  # SELL
+            tp_price = entry_price * (1 - TP_PERCENT)
+            sl_price = entry_price * (1 + SL_PERCENT)
+        
+        return tp_price, sl_price, TP_PERCENT, SL_PERCENT
+        
+    except Exception as e:
+        print(f"❌ Ошибка расчета TP/SL: {e}")
+        # Fallback на фиксированные проценты
+        if side.upper() == 'BUY':
+            return (entry_price * 1.02, entry_price * 0.99, 0.02, 0.01)
+        else:
+            return (entry_price * 0.98, entry_price * 1.01, 0.02, 0.01)
+
+
 def refresh_positions_cache():
     """Обновление кэша позиций с Binance"""
     try:
@@ -394,6 +470,17 @@ def open_position(symbol: str, side: str):
         if opened_position:
             print(f"✅ ПОЗИЦИЯ ОТКРЫТА НА BINANCE!")
             
+            from data_store import klines_cache
+            df = klines_cache.get(symbol)
+        
+            entry_price = float(opened_position.get('entryPrice', current_price))
+        
+            # Рассчитываем TP/SL
+            tp_price, sl_price, tp_percent, sl_percent = calculate_tp_sl(
+                entry_price, 
+                side.upper(), 
+                df
+            )
             # Создаем данные позиции
             pos_data = {
                 "symbol": symbol,
@@ -406,8 +493,33 @@ def open_position(symbol: str, side: str):
                 "status": "OPEN",
                 "source": "binance_real",
                 "order_id": order['orderId'],
-                "timestamp": time.time()
+                "timestamp": time.time(),
+
+                "tp_price": tp_price,
+                "sl_price": sl_price,
+                "tp_percent": tp_percent,
+                "sl_percent": sl_percent,
+                "trail_percent": TRAILING_STOP_PERCENT,
+                "highest_price": entry_price if side.upper() == 'BUY' else entry_price,
+                "lowest_price": entry_price if side.upper() == 'SELL' else entry_price,
+                "trailing_active": False,
+                "exit_reason": None
+
             }
+            
+            print(f"🎯 УСТАНОВЛЕНЫ TP/SL:")
+            print(f"   Стратегия: {TP_STRATEGY.upper()}")
+        
+            if side.upper() == 'BUY':
+                print(f"   Take Profit: {tp_price:.4f} (+{tp_percent*100:.1f}%)")
+                print(f"   Stop Loss: {sl_price:.4f} (-{sl_percent*100:.1f}%)")
+            else:
+                print(f"   Take Profit: {tp_price:.4f} (-{tp_percent*100:.1f}%)")
+                print(f"   Stop Loss: {sl_price:.4f} (+{sl_percent*100:.1f}%)")
+        
+            print(f"   Трейлинг стоп: {TRAILING_STOP_PERCENT*100}%")
+            
+            
             
             print(f"📊 Данные с Binance:")
             print(f"   Количество: {pos_data['qty']}")
@@ -754,3 +866,162 @@ def close_position(symbol: str, exit_price: float, exit_reason=None):
     
     finally:
         print(f"{'='*50}\n")
+def auto_close_positions():
+    """Автоматическая проверка и закрытие позиций по TP/SL"""
+    from data_store import user_data_cache
+    from binance_client import binance_client
+    
+    positions_dict = user_data_cache.get("positions", {})
+    
+    if not positions_dict:
+        return []
+    
+    closed_symbols = []
+    
+    for symbol, pos in list(positions_dict.items()):
+        try:
+            # Проверяем только открытые позиции
+            if pos.get('status') != 'OPEN':
+                continue
+            
+            # Получаем текущую цену
+            current_price = binance_client.get_ticker_price(symbol)
+            
+            # Обновляем текущую цену в позиции
+            pos['current_price'] = current_price
+            
+            side = pos.get('side', 'BUY').upper()
+            entry = pos.get('entry', 0)
+            tp_price = pos.get('tp_price')
+            sl_price = pos.get('sl_price')
+            trail_percent = pos.get('trail_percent', 0.005)
+            
+            exit_reason = None
+            
+            # ========== ОБНОВЛЕНИЕ ТРЕЙЛИНГ СТОПА ==========
+            if side == 'BUY':
+                # Для LONG: обновляем максимальную цену
+                current_high = pos.get('highest_price', entry)
+                new_high = max(current_high, current_price)
+                pos['highest_price'] = new_high
+                
+                # Активируем трейлинг после движения +1%
+                if current_price >= entry * 1.01 and not pos.get('trailing_active', False):
+                    pos['trailing_active'] = True
+                    print(f"📈 Активирован трейлинг стоп для {symbol}")
+                
+                # Подтягиваем SL вверх если трейлинг активен
+                if pos.get('trailing_active', False):
+                    trailing_stop = new_high * (1 - trail_percent)
+                    if trailing_stop > sl_price:
+                        pos['sl_price'] = trailing_stop
+                        print(f"🔼 {symbol}: Трейлинг стоп поднят до {trailing_stop:.4f}")
+            
+            else:  # SELL
+                # Для SHORT: обновляем минимальную цену
+                current_low = pos.get('lowest_price', entry)
+                new_low = min(current_low, current_price)
+                pos['lowest_price'] = new_low
+                
+                # Активируем трейлинг после движения -1%
+                if current_price <= entry * 0.99 and not pos.get('trailing_active', False):
+                    pos['trailing_active'] = True
+                    print(f"📉 Активирован трейлинг стоп для {symbol}")
+                
+                # Подтягиваем SL вниз если трейлинг активен
+                if pos.get('trailing_active', False):
+                    trailing_stop = new_low * (1 + trail_percent)
+                    if trailing_stop < sl_price:
+                        pos['sl_price'] = trailing_stop
+                        print(f"🔽 {symbol}: Трейлинг стоп опущен до {trailing_stop:.4f}")
+            
+            # ========== ПРОВЕРКА TP/SL ==========
+            if side == 'BUY':
+                if tp_price and current_price >= tp_price:
+                    exit_reason = "TAKE_PROFIT"
+                elif sl_price and current_price <= sl_price:
+                    exit_reason = "STOP_LOSS"
+            
+            else:  # SELL
+                if tp_price and current_price <= tp_price:
+                    exit_reason = "TAKE_PROFIT"
+                elif sl_price and current_price >= sl_price:
+                    exit_reason = "STOP_LOSS"
+            
+            # ========== ЗАКРЫТИЕ ПОЗИЦИИ ==========
+            if exit_reason:
+                print(f"\n{'='*50}")
+                print(f"🚨 АВТОМАТИЧЕСКОЕ ЗАКРЫТИЕ: {symbol}")
+                print(f"📊 Причина: {exit_reason}")
+                print(f"💰 Цена входа: {entry:.4f}")
+                print(f"💰 Цена выхода: {current_price:.4f}")
+                
+                if side == 'BUY':
+                    pnl = (current_price - entry) * pos['qty']
+                else:
+                    pnl = (entry - current_price) * pos['qty']
+                
+                pnl_percent = (pnl / (entry * pos['qty'])) * 100 if entry > 0 else 0
+                print(f"💰 PnL: {pnl:+.2f} ({pnl_percent:+.2f}%)")
+                print(f"{'='*50}")
+                
+                # Закрываем позицию
+                success = close_position(symbol, current_price, exit_reason)
+                
+                if success:
+                    # Удаляем из кэша
+                    if symbol in positions_dict:
+                        del positions_dict[symbol]
+                    
+                    closed_symbols.append({
+                        'symbol': symbol,
+                        'reason': exit_reason,
+                        'pnl': pnl,
+                        'pnl_percent': pnl_percent
+                    })
+                    
+                    print(f"✅ {symbol} закрыт по {exit_reason}")
+                    
+                    # Отправляем уведомление в Telegram
+                    try:
+                        from telegram_bot import send_trade_closed
+                        
+                        trade_data = {
+                            'symbol': symbol,
+                            'side': side,
+                            'qty': pos['qty'],
+                            'entry_price': entry,
+                            'exit_price': current_price,
+                            'pnl': pnl,
+                            'pnl_percent': pnl_percent,
+                            'reason': exit_reason,
+                            'mode': 'REAL'
+                        }
+                        
+                        send_trade_closed(trade_data)
+                    except Exception as tg_error:
+                        print(f"⚠️  Не удалось отправить в Telegram: {tg_error}")
+                
+                else:
+                    print(f"❌ Не удалось закрыть позицию {symbol}")
+            
+            # Обновляем позицию в кэше
+            else:
+                # Пересчитываем PnL
+                if side == 'BUY':
+                    pnl = (current_price - entry) * pos['qty']
+                else:
+                    pnl = (entry - current_price) * pos['qty']
+                
+                pos['unrealized_pnl'] = pnl
+                positions_dict[symbol] = pos
+        
+        except Exception as e:
+            print(f"❌ Ошибка проверки позиции {symbol}: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    # Обновляем кэш
+    user_data_cache["positions"] = positions_dict
+    
+    return closed_symbols
