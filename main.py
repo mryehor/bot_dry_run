@@ -6,7 +6,6 @@
 import asyncio
 import time
 import traceback
-import threading
 import sys
 from datetime import datetime
 
@@ -18,16 +17,21 @@ from config import (
     MAX_SPREAD_PERCENT, TRADING_MODE, USE_BBRSI, USE_BREAKOUT,
     BBRSI_PARAM_GRID, BREAKOUT_PARAM_GRID, INITIAL_CASH,
     LEVERAGE, RISK_FRACTION, LOG_FILE,
-    TELEGRAM_BOT_TOKEN, TELEGRAM_MY_CHAT_ID, TELEGRAM_CHANNEL_ID
+    TELEGRAM_BOT_TOKEN, TELEGRAM_MY_CHAT_ID, TELEGRAM_CHANNEL_ID,
+    # TP/SL настройки
+    TP_STRATEGY, TP_PERCENT, SL_PERCENT, TRAILING_STOP_PERCENT,
+    RR_RATIO, RISK_PERCENT, ATR_TP_MULTIPLIER, ATR_SL_MULTIPLIER, ATR_PERIOD
 )
 from strategies import BBRSI_EMA_Strategy, Breakout_Strategy, get_trading_signal
 from pos_manager import (
-    get_open_position, open_position, close_position, init_binance_client
+    get_open_position, open_position, close_position, init_binance_client,
+    auto_close_positions, check_all_positions_tp_sl, ensure_correct_leverage,
+    calculate_tp_sl, calculate_atr, check_position_tp_sl
 )
 from backtesting.lib import FractionalBacktest
 from utils import bol_h, bol_l, rsi, validate_trade_params
 from pnl_utils import simulate_realtime_pnl, get_total_pnl, format_pnl_message
-from data_store import load_positions_from_file, save_positions_to_file, klines_cache
+from data_store import load_positions_from_file, save_positions_to_file, klines_cache, user_data_cache
 
 # Импорт Telegram бота
 from telegram_bot import (
@@ -40,11 +44,16 @@ from telegram_bot import (
     send_trade_closed,
     send_status_update,
     send_error,
-    send_to_me  # Добавляем для простых сообщений
+    send_to_me
 )
 
-# ========== ОПТИМИЗАЦИЯ ==========
+# Импорт pandas для ATR расчета
+import pandas as pd
+
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
+
 def optimize_params_ws(symbol, strategy_class, param_grid):
+    """Оптимизация параметров стратегии"""
     df = klines_cache.get(symbol)
     if df is None or len(df) < 150:
         return None
@@ -119,23 +128,254 @@ def optimize_and_select_top_ws(symbols):
     top5 = results[:5]
     print("[INFO] Top5 монет:", top5)
     return top5
+
+def check_balance_sufficient():
+    """Проверка достаточности баланса для торговли"""
+    if TRADING_MODE != 'real':
+        return True
     
+    try:
+        balance = binance_client.get_balance('USDT')
+        # Минимальные требования
+        MIN_BALANCE_REQUIRED = 50  # USDT
+        MIN_MARGIN_REQUIRED = 10   # USDT маржи
+        
+        if balance < MIN_BALANCE_REQUIRED:
+            print(f"❌ Недостаточно баланса: {balance:.2f} USDT < {MIN_BALANCE_REQUIRED} USDT")
+            return False
+        
+        return True
+    except Exception as e:
+        print(f"❌ Ошибка проверки баланса: {e}")
+        return False
+
+# ========== ТОРГОВЫЙ ЦИКЛ ==========
+
+async def trade_symbol_loop(symbol):
+    """Основной торговый цикл для символа"""
+    
+    print(f"📈 Запущен торговый цикл для {symbol} (Режим: {TRADING_MODE})")
+    
+    last_position_check = 0
+    position_check_interval = 10
+    
+    while True:
+        try:
+            current_time = time.time()
+            
+            # Проверяем, можно ли торговать
+            if not should_trade():
+                await asyncio.sleep(CHECK_INTERVAL)
+                continue
+            
+            df = klines_cache.get(symbol)
+            if df is None or len(df) < 20:
+                await asyncio.sleep(CHECK_INTERVAL)
+                continue
+
+            # Проверка позиции
+            if current_time - last_position_check > position_check_interval:
+                pos = get_open_position(symbol)
+                
+                if TRADING_MODE == 'real' and (not pos or pos.get('source') != 'binance_real'):
+                    try:
+                        positions = binance_client.get_positions()
+                        found_real = False
+                        
+                        for binance_pos in positions:
+                            binance_symbol = binance_pos.get('symbol', '')
+                            search_symbol = symbol.replace('USDT', '')
+                            
+                            if binance_symbol == search_symbol:
+                                position_amt = float(binance_pos.get('positionAmt', 0))
+                                if abs(position_amt) > 0:
+                                    pos = {
+                                        "symbol": symbol,
+                                        "side": "BUY" if position_amt > 0 else "SELL",
+                                        "qty": abs(position_amt),
+                                        "entry": float(binance_pos.get('entryPrice', 0)),
+                                        "current_price": float(df["Close"].iloc[-1]),
+                                        "source": "binance_real",
+                                        "status": "OPEN",
+                                        "timestamp": current_time
+                                    }
+                                    
+                                    positions_dict = user_data_cache.get("positions", {})
+                                    positions_dict[symbol] = pos
+                                    user_data_cache["positions"] = positions_dict
+                                    found_real = True
+                                    break
+                        
+                        if not found_real:
+                            print(f"ℹ️  Нет реальной позиции на Binance для {symbol}")
+                    
+                    except Exception as e:
+                        print(f"❌ Ошибка проверки реальной позиции {symbol}: {e}")
+                
+                last_position_check = current_time
+            
+            # Проверяем позицию
+            pos = get_open_position(symbol)
+            
+            if pos:
+                price_last = float(df["Close"].iloc[-1])
+                entry = pos.get("entry", price_last)
+                qty = pos.get("qty", 0)
+                
+                if qty > 0:
+                    # Расчет PnL
+                    if pos.get('side') == "BUY":
+                        pnl = (price_last - entry) * qty
+                    else:
+                        pnl = (entry - price_last) * qty
+                    
+                    pnl_percent = (pnl / (entry * qty)) * 100 if entry > 0 and qty > 0 else 0
+                    
+                    print(f"⏳ {symbol} {pos.get('side')}: entry={entry:.4f}, current={price_last:.4f}, "
+                          f"qty={qty:.4f}, PnL={pnl:+.2f} ({pnl_percent:+.2f}%)")
+                    
+                    # Для реальных позиций проверяем статус
+                    if TRADING_MODE == 'real' and pos.get('source') == 'binance_real':
+                        try:
+                            positions = binance_client.get_positions()
+                            still_open = False
+                            
+                            for binance_pos in positions:
+                                if binance_pos.get('symbol') == symbol.replace('USDT', ''):
+                                    position_amt = float(binance_pos.get('positionAmt', 0))
+                                    if abs(position_amt) > 0:
+                                        still_open = True
+                                        if abs(position_amt) != qty:
+                                            print(f"⚠️  Количество изменилось: было {qty}, стало {abs(position_amt)}")
+                                            pos['qty'] = abs(position_amt)
+                                            
+                                            if symbol in user_data_cache.get("positions", {}):
+                                                user_data_cache["positions"][symbol]['qty'] = abs(position_amt)
+                                        break
+                            
+                            if not still_open:
+                                print(f"⚠️  Позиция {symbol} закрыта на Binance, удаляю из кэша")
+                                if symbol in user_data_cache.get("positions", {}):
+                                    user_data_cache["positions"].pop(symbol)
+                        
+                        except Exception as e:
+                            print(f"❌ Ошибка проверки статуса реальной позиции: {e}")
+                
+                await asyncio.sleep(CHECK_INTERVAL)
+                continue
+
+            # Проверка ожидающих ордеров
+            if TRADING_MODE == 'real':
+                positions_dict = user_data_cache.get("positions", {})
+                cached_pos = positions_dict.get(symbol)
+                
+                if cached_pos and cached_pos.get('order_id'):
+                    print(f"⚠️  Для {symbol} есть ожидающий ордер: {cached_pos.get('order_id')}")
+                    await asyncio.sleep(CHECK_INTERVAL)
+                    continue
+
+            # Проверка сигналов
+            signal = get_trading_signal(symbol, df, strategy="bb_rsi")
+            
+            if not signal and USE_BREAKOUT:
+                signal = get_trading_signal(symbol, df, strategy="breakout")
+            
+            if signal:
+                price_last = float(df["Close"].iloc[-1])
+                msg = f"⚡ Сигнал для {symbol}: {signal} | Цена: {price_last:.4f}"
+                print(msg)
+                
+                try:
+                    send_to_me(f"⚡ СИГНАЛ: {symbol} {signal} @ {price_last:.4f}")
+                except:
+                    print("⚠️  Не удалось отправить в Telegram")
+                
+                # Дополнительная проверка для реальной торговли
+                if TRADING_MODE == 'real':
+                    try:
+                        balance = binance_client.get_balance('USDT')
+                        if balance < 20:
+                            print(f"❌ Недостаточно баланса: {balance:.2f} USDT < 20 USDT")
+                            await asyncio.sleep(CHECK_INTERVAL)
+                            continue
+                    except Exception as e:
+                        print(f"❌ Не удалось проверить баланс: {e}")
+                        await asyncio.sleep(CHECK_INTERVAL)
+                        continue
+                
+                side = signal
+                
+                if TRADING_MODE == 'real':
+                    print(f"🚨 РЕАЛЬНАЯ СДЕЛКА (АВТО): {side} {symbol} @ {price_last:.4f}")
+                    print("✅ Подтверждение автоматическое - открываем позицию")
+                
+                try:
+                    # Устанавливаем правильное плечо перед открытием
+                    if TRADING_MODE == 'real':
+                        ensure_correct_leverage(symbol, LEVERAGE)
+                    
+                    pos_data = open_position(symbol, side, risk_fraction=RISK_FRACTION)
+                    
+                    if pos_data:
+                        success_msg = f"✅ Позиция открыта: {side} для {symbol} @ {price_last:.4f}"
+                        print(success_msg)
+                        
+                        try:
+                            if TRADING_MODE == 'real':
+                                send_to_me(f"🚨 РЕАЛЬНАЯ СДЕЛКА: {success_msg}")
+                            else:
+                                send_to_me(f"💰 ТЕСТОВАЯ СДЕЛКА: {success_msg}")
+                        except:
+                            print("⚠️  Не удалось отправить уведомление о сделке")
+                        
+                        await asyncio.sleep(CHECK_INTERVAL * 2)
+                    else:
+                        error_msg = f"❌ Не удалось открыть позицию для {symbol}"
+                        print(error_msg)
+                        try:
+                            send_error(error_msg)
+                        except:
+                            pass
+                        
+                        await asyncio.sleep(CHECK_INTERVAL * 3)
+                        
+                except Exception as e:
+                    error_msg = f"❌ Ошибка открытия позиции для {symbol}: {e}"
+                    print(error_msg)
+                    try:
+                        send_error(error_msg)
+                    except:
+                        pass
+                    traceback.print_exc()
+                    
+                    await asyncio.sleep(CHECK_INTERVAL * 5)
+
+        except Exception as e:
+            error_msg = f"❌ Критическая ошибка в торговом цикле {symbol}: {e}"
+            print(error_msg)
+            
+            try:
+                send_error(error_msg)
+            except:
+                pass
+            traceback.print_exc()
+            
+            await asyncio.sleep(CHECK_INTERVAL * 10)
+
+        await asyncio.sleep(CHECK_INTERVAL)
+
 # ========== ЦИКЛ МОНИТОРИНГА TP/SL ==========
+
 async def tp_sl_monitor_loop():
     """Цикл мониторинга и закрытия позиций по TP/SL"""
     print("🎯 Запуск цикла мониторинга TP/SL...")
     
-    from pos_manager import auto_close_positions
-    from telegram_bot import send_to_me
-    
-    check_interval = 10  # Проверять каждые 10 секунд
+    check_interval = 10
     last_report_time = time.time()
-    report_interval = 300  # Отчет каждые 5 минут
+    report_interval = 300
     
     while True:
         try:
-            # Проверяем статус торговли
-            from telegram_bot import should_trade
             if not should_trade():
                 await asyncio.sleep(30)
                 continue
@@ -162,14 +402,13 @@ PnL: {pos['pnl']:+.2f} ({pos['pnl_percent']:+.2f}%)
             # Периодический отчет
             current_time = time.time()
             if current_time - last_report_time > report_interval:
-                from data_store import user_data_cache
                 positions_dict = user_data_cache.get("positions", {})
                 open_positions = [p for p in positions_dict.values() if p.get('status') == 'OPEN']
                 
                 if open_positions:
                     report = f"📊 ОТКРЫТЫЕ ПОЗИЦИИ ({len(open_positions)}):\n"
                     
-                    for pos in open_positions[:5]:  # Первые 5 позиций
+                    for pos in open_positions[:5]:
                         side = pos.get('side', 'BUY')
                         entry = pos.get('entry', 0)
                         current = pos.get('current_price', entry)
@@ -177,7 +416,6 @@ PnL: {pos['pnl']:+.2f} ({pos['pnl_percent']:+.2f}%)
                         sl = pos.get('sl_price', 0)
                         pnl = pos.get('unrealized_pnl', 0)
                         
-                        # Расчет расстояния до TP/SL в %
                         if side == 'BUY':
                             to_tp = ((tp - current) / current) * 100 if tp > 0 else 0
                             to_sl = ((current - sl) / current) * 100 if sl > 0 else 0
@@ -203,282 +441,8 @@ PnL: {pos['pnl']:+.2f} ({pos['pnl_percent']:+.2f}%)
             print(f"❌ Ошибка в цикле мониторинга TP/SL: {e}")
             await asyncio.sleep(30)
 
+# ========== ЦИКЛ МОНИТОРИНГА СИСТЕМЫ ==========
 
-# ========== ТОРГОВЫЙ ЦИКЛ ==========
-async def trade_symbol_loop(symbol):
-    """Основной торговый цикл для символа"""
-    
-    print(f"📈 Запущен торговый цикл для {symbol} (Режим: {TRADING_MODE})")
-    
-    # Переменные для отслеживания
-    last_position_check = 0
-    position_check_interval = 10  # Проверять позицию каждые 10 секунд
-    
-    while True:
-        try:
-            current_time = time.time()
-            
-            # Проверяем, можно ли торговать
-            if not should_trade():
-                await asyncio.sleep(CHECK_INTERVAL)
-                continue
-            
-            df = klines_cache.get(symbol)
-            if df is None or len(df) < 20:
-                await asyncio.sleep(CHECK_INTERVAL)
-                continue
-
-            # УЛУЧШЕННАЯ ПРОВЕРКА ПОЗИЦИИ
-            if current_time - last_position_check > position_check_interval:
-                # 1. Проверяем позицию через стандартную функцию
-                pos = get_open_position(symbol)
-                
-                # 2. Для реальной торговли дополнительно проверяем Binance
-                if TRADING_MODE == 'real' and (not pos or pos.get('source') != 'binance_real'):
-                    try:
-                        from binance_client import binance_client
-                        if binance_client:
-                            # Получаем реальные позиции с Binance
-                            positions = binance_client.get_positions()
-                            found_real = False
-                            
-                            for binance_pos in positions:
-                                # Приводим символы к одному формату
-                                binance_symbol = binance_pos.get('symbol', '')
-                                search_symbol = symbol.replace('USDT', '')
-                                
-                                if binance_symbol == search_symbol:
-                                    position_amt = float(binance_pos.get('positionAmt', 0))
-                                    if abs(position_amt) > 0:
-                                        print(f"✅ Найдена реальная позиция на Binance: {symbol}")
-                                        print(f"   Количество: {position_amt}")
-                                        print(f"   Цена входа: {binance_pos.get('entryPrice', 'unknown')}")
-                                        
-                                        # Создаем объект позиции
-                                        pos = {
-                                            "symbol": symbol,
-                                            "side": "BUY" if position_amt > 0 else "SELL",
-                                            "qty": abs(position_amt),
-                                            "entry": float(binance_pos.get('entryPrice', 0)),
-                                            "current_price": float(df["Close"].iloc[-1]),
-                                            "source": "binance_real",
-                                            "status": "OPEN",
-                                            "timestamp": current_time
-                                        }
-                                        
-                                        # Сохраняем в кэш
-                                        from data_store import user_data_cache
-                                        positions_dict = user_data_cache.get("positions", {})
-                                        positions_dict[symbol] = pos
-                                        user_data_cache["positions"] = positions_dict
-                                        
-                                        found_real = True
-                                        break
-                            
-                            if not found_real:
-                                print(f"ℹ️  Нет реальной позиции на Binance для {symbol}")
-                    
-                    except Exception as e:
-                        print(f"❌ Ошибка проверки реальной позиции {symbol}: {e}")
-                
-                last_position_check = current_time
-            
-            # Проверяем позицию снова (возможно обновилась)
-            pos = get_open_position(symbol)
-            
-            if pos:
-                price_last = float(df["Close"].iloc[-1])
-                entry = pos.get("entry", price_last)
-                qty = pos.get("qty", 0)
-                
-                if qty > 0:
-                    # Расчет PnL
-                    if pos.get('side') == "BUY":
-                        pnl = (price_last - entry) * qty
-                    else:
-                        pnl = (entry - price_last) * qty
-                    
-                    pnl_percent = (pnl / (entry * qty)) * 100 if entry > 0 and qty > 0 else 0
-                    
-                    # Логируем статус позиции
-                    print(f"⏳ {symbol} {pos.get('side')}: "
-                          f"entry={entry:.4f}, current={price_last:.4f}, "
-                          f"qty={qty:.4f}, PnL={pnl:+.2f} ({pnl_percent:+.2f}%)")
-                    
-                    # Для реальных позиций периодически проверяем статус
-                    if TRADING_MODE == 'real' and pos.get('source') == 'binance_real':
-                        try:
-                            from binance_client import binance_client
-                            positions = binance_client.get_positions()
-                            
-                            still_open = False
-                            for binance_pos in positions:
-                                if binance_pos.get('symbol') == symbol.replace('USDT', ''):
-                                    position_amt = float(binance_pos.get('positionAmt', 0))
-                                    if abs(position_amt) > 0:
-                                        still_open = True
-                                        
-                                        # Обновляем количество если изменилось
-                                        if abs(position_amt) != qty:
-                                            print(f"⚠️  Количество изменилось: было {qty}, стало {abs(position_amt)}")
-                                            pos['qty'] = abs(position_amt)
-                                            
-                                            # Обновляем в кэше
-                                            from data_store import user_data_cache
-                                            if symbol in user_data_cache.get("positions", {}):
-                                                user_data_cache["positions"][symbol]['qty'] = abs(position_amt)
-                                        break
-                            
-                            if not still_open:
-                                print(f"⚠️  Позиция {symbol} закрыта на Binance, удаляю из кэша")
-                                # Очищаем из кэша
-                                from data_store import user_data_cache
-                                if symbol in user_data_cache.get("positions", {}):
-                                    user_data_cache["positions"].pop(symbol)
-                        
-                        except Exception as e:
-                            print(f"❌ Ошибка проверки статуса реальной позиции: {e}")
-                
-                await asyncio.sleep(CHECK_INTERVAL)
-                continue
-
-            # ПРОВЕРКА ОЖИДАЮЩИХ ОРДЕРОВ
-            if TRADING_MODE == 'real':
-                from data_store import user_data_cache
-                positions_dict = user_data_cache.get("positions", {})
-                cached_pos = positions_dict.get(symbol)
-                
-                if cached_pos and cached_pos.get('order_id'):
-                    print(f"⚠️  Для {symbol} есть ожидающий ордер: {cached_pos.get('order_id')}")
-                    print(f"   Пропускаю торговый цикл пока ордер не исполнится")
-                    
-                    # Проверяем статус ордера
-                    try:
-                        from binance_client import binance_client
-                        from pos_manager import check_order_status
-                        
-                        order_status = check_order_status(cached_pos['order_id'], symbol)
-                        
-                        if order_status.get('status') == 'FILLED':
-                            print(f"✅ Ордер {cached_pos['order_id']} исполнен!")
-                            # Обновляем статус позиции
-                            cached_pos['status'] = 'OPEN'
-                            positions_dict[symbol] = cached_pos
-                            user_data_cache["positions"] = positions_dict
-                        elif order_status.get('status') in ['CANCELED', 'REJECTED', 'EXPIRED']:
-                            print(f"❌ Ордер {cached_pos['order_id']} отменен/отклонен")
-                            # Удаляем из кэша
-                            positions_dict.pop(symbol, None)
-                            user_data_cache["positions"] = positions_dict
-                    
-                    except Exception as e:
-                        print(f"❌ Ошибка проверки ордера: {e}")
-                    
-                    await asyncio.sleep(CHECK_INTERVAL)
-                    continue
-
-            # ТОЛЬКО ЕСЛИ НЕТ ПОЗИЦИИ И НЕТ ОЖИДАЮЩИХ ОРДЕРОВ - ПРОВЕРЯЕМ СИГНАЛЫ
-            signal = get_trading_signal(symbol, df, strategy="bb_rsi")
-            
-            if not signal and USE_BREAKOUT:
-                signal = get_trading_signal(symbol, df, strategy="breakout")
-            
-            if signal:
-                price_last = float(df["Close"].iloc[-1])
-                msg = f"⚡ Сигнал для {symbol}: {signal} | Цена: {price_last:.4f}"
-                print(msg)
-                
-                # Отправляем уведомление в Telegram (ИСПРАВЛЕНО)
-                try:
-                    # Отправляем простое сообщение вместо send_signal_alert
-                    send_to_me(f"⚡ СИГНАЛ: {symbol} {signal} @ {price_last:.4f}")
-                except:
-                    print("⚠️  Не удалось отправить в Telegram")
-                
-                # Дополнительная проверка для реальной торговли
-                if TRADING_MODE == 'real':
-                    # Проверяем баланс
-                    try:
-                        from binance_client import binance_client
-                        balance = binance_client.get_balance('USDT')
-                        if balance < 20:  # Минимальный номинал
-                            print(f"❌ Недостаточно баланса: {balance:.2f} USDT < 20 USDT")
-                            await asyncio.sleep(CHECK_INTERVAL)
-                            continue
-                    except Exception as e:
-                        print(f"❌ Не удалось проверить баланс: {e}")
-                        await asyncio.sleep(CHECK_INTERVAL)
-                        continue
-                
-                # Открываем позицию (АВТОМАТИЧЕСКИ - без подтверждения)
-                side = signal  # "BUY" или "SELL"
-                
-                if TRADING_MODE == 'real':
-                    print(f"🚨 РЕАЛЬНАЯ СДЕЛКА (АВТО): {side} {symbol} @ {price_last:.4f}")
-                    # Автоматически подтверждаем сделку для реальной торговли
-                    print("✅ Подтверждение автоматическое - открываем позицию")
-                
-                try:
-                    # Используем параметр risk_fraction из config
-                    pos_data = open_position(symbol, side, risk_fraction=RISK_FRACTION)
-                    
-                    if pos_data:
-                        success_msg = f"✅ Позиция открыта: {side} для {symbol} @ {price_last:.4f}"
-                        print(success_msg)
-                        
-                        quantity = pos_data.get('qty', 0)
-                        notional = price_last * quantity
-                        
-                        # Отправляем алерты (ИСПРАВЛЕНО)
-                        try:
-                            if TRADING_MODE == 'real':
-                                send_to_me(f"🚨 РЕАЛЬНАЯ СДЕЛКА: {success_msg}")
-                            else:
-                                send_to_me(f"💰 ТЕСТОВАЯ СДЕЛКА: {success_msg}")
-                        except:
-                            print("⚠️  Не удалось отправить уведомление о сделке")
-                        
-                        # После открытия позиции ждем дольше перед следующей проверкой
-                        await asyncio.sleep(CHECK_INTERVAL * 2)
-                    else:
-                        error_msg = f"❌ Не удалось открыть позицию для {symbol}"
-                        print(error_msg)
-                        try:
-                            send_error(error_msg)
-                        except:
-                            pass
-                        
-                        # При ошибке ждем немного дольше
-                        await asyncio.sleep(CHECK_INTERVAL * 3)
-                        
-                except Exception as e:
-                    error_msg = f"❌ Ошибка открытия позиции для {symbol}: {e}"
-                    print(error_msg)
-                    try:
-                        send_error(error_msg)
-                    except:
-                        pass
-                    traceback.print_exc()
-                    
-                    # При ошибке ждем дольше
-                    await asyncio.sleep(CHECK_INTERVAL * 5)
-
-        except Exception as e:
-            error_msg = f"❌ Критическая ошибка в торговом цикле {symbol}: {e}"
-            print(error_msg)
-            
-            try:
-                send_error(error_msg)
-            except:
-                pass
-            traceback.print_exc()
-            
-            # При критической ошибке ждем дольше
-            await asyncio.sleep(CHECK_INTERVAL * 10)
-
-        await asyncio.sleep(CHECK_INTERVAL)
-
-# ========== ЦИКЛ МОНИТОРИНГА ==========
 async def monitoring_loop():
     """Цикл мониторинга системы"""
     
@@ -489,30 +453,25 @@ async def monitoring_loop():
     last_cache_refresh = time.time()
     last_cleanup = time.time()
     
-    pnl_report_interval = 300  # 5 минут
-    status_report_interval = 3600  # 1 час
-    cache_refresh_interval = 30  # 30 секунд
-    cleanup_interval = 300  # 5 минут
+    pnl_report_interval = 300
+    status_report_interval = 3600
+    cache_refresh_interval = 30
+    cleanup_interval = 300
     
     while True:
         try:
             current_time = time.time()
             
-            # 1. ОБНОВЛЕНИЕ КЭША ПОЗИЦИЙ (каждые 30 секунд)
+            # Обновление кэша позиций
             if current_time - last_cache_refresh > cache_refresh_interval:
                 try:
                     print(f"🔄 Обновление кэша позиций...")
                     
                     if TRADING_MODE == 'real':
-                        # Получаем реальные позиции с Binance
-                        from binance_client import binance_client
-                        from data_store import user_data_cache
-                        
                         try:
                             positions = binance_client.get_positions()
                             positions_dict = user_data_cache.get("positions", {})
                             
-                            # Очищаем старые реальные позиции из кэша
                             keys_to_remove = []
                             for key, pos in positions_dict.items():
                                 if pos.get('source') == 'binance_real':
@@ -521,7 +480,6 @@ async def monitoring_loop():
                             for key in keys_to_remove:
                                 positions_dict.pop(key, None)
                             
-                            # Добавляем актуальные позиции с Binance
                             for pos in positions:
                                 position_amt = float(pos.get('positionAmt', 0))
                                 
@@ -530,7 +488,6 @@ async def monitoring_loop():
                                     if not symbol.endswith('USDT'):
                                         symbol = symbol + 'USDT'
                                     
-                                    # Получаем текущую цену из кэша свечей
                                     current_price = 0
                                     try:
                                         df = klines_cache.get(symbol)
@@ -562,12 +519,11 @@ async def monitoring_loop():
                 except Exception as e:
                     print(f"❌ Ошибка при обновлении кэша: {e}")
             
-            # 2. ОЧИСТКА УСТАРЕВШИХ ПОЗИЦИЙ (каждые 5 минут)
+            # Очистка устаревших позиций
             if current_time - last_cleanup > cleanup_interval:
                 try:
                     print(f"🧹 Очистка устаревших записей...")
                     
-                    from data_store import user_data_cache
                     positions_dict = user_data_cache.get("positions", {})
                     
                     if positions_dict:
@@ -577,12 +533,9 @@ async def monitoring_loop():
                         for symbol, pos in positions_dict.items():
                             last_updated = pos.get('last_updated', 0)
                             
-                            # Удаляем записи старше 1 часа
                             if current_time - last_updated > 3600:
                                 keys_to_remove.append(symbol)
                                 removed_count += 1
-                            
-                            # Удаляем позиции с нулевым количеством
                             elif pos.get('qty', 0) <= 0:
                                 keys_to_remove.append(symbol)
                                 removed_count += 1
@@ -598,33 +551,29 @@ async def monitoring_loop():
                 except Exception as e:
                     print(f"❌ Ошибка очистки: {e}")
             
-            # 3. Отчет о PnL каждые 5 минут
+            # Отчет о PnL
             if current_time - last_pnl_report > pnl_report_interval:
                 try:
                     pnl_data = get_total_pnl()
                     pnl_message = format_pnl_message(pnl_data)
                     
-                    # Отправляем отчет в Telegram (ИСПРАВЛЕНО)
                     try:
                         send_to_me(f"📊 ОТЧЕТ PnL:\n{pnl_message}")
                     except:
                         print("⚠️  Не удалось отправить отчет PnL")
                     
-                    # Выводим в консоль
                     print(f"\n📊 Отчет PnL ({TRADING_MODE}):")
                     print(f"   Закрытый PnL: {pnl_data['realized']:.2f}")
                     print(f"   Открытый PnL: {pnl_data['unrealized']:.2f}")
                     print(f"   Общий PnL: {pnl_data['total']:.2f}")
                     
-                    # Дополнительная информация о позициях
                     try:
-                        from data_store import user_data_cache
                         positions_dict = user_data_cache.get("positions", {})
                         open_positions = [p for p in positions_dict.values() if p.get('status') == 'OPEN']
                         
                         if open_positions:
                             print(f"   📈 Открытых позиций: {len(open_positions)}")
-                            for pos in open_positions[:3]:  # Показываем первые 3
+                            for pos in open_positions[:3]:
                                 pnl_pos = pos.get('unrealized_pnl', 0)
                                 if pnl_pos != 0:
                                     print(f"     {pos['symbol']}: {pnl_pos:+.2f}")
@@ -635,12 +584,11 @@ async def monitoring_loop():
                 except Exception as e:
                     print(f"❌ Ошибка при получении PnL: {e}")
             
-            # 4. Отчет о статусе каждые час
+            # Отчет о статусе
             if current_time - last_status_report > status_report_interval:
                 try:
                     status = get_trading_status()
                     if not status.get("paused", False):
-                        # Отправляем обновление статуса
                         try:
                             status_msg = f"""
 📊 СТАТУС БОТА:
@@ -660,14 +608,13 @@ async def monitoring_loop():
                 except Exception as e:
                     print(f"❌ Ошибка при отправке статуса: {e}")
             
-            # 5. Проверка статуса системы
+            # Проверка статуса
             status = get_trading_status()
             if status["paused"] and TRADING_MODE == 'real':
                 print("⚠️  Торговля на паузе в РЕАЛЬНОМ режиме!")
             
-            # 6. ПРОВЕРКА КРИТИЧЕСКИХ ОШИБОК
+            # Проверка критических ошибок
             try:
-                from data_store import user_data_cache
                 error_count = user_data_cache.get("error_count", 0)
                 if error_count > 10:
                     print(f"🚨 Критическое количество ошибок: {error_count}")
@@ -675,27 +622,25 @@ async def monitoring_loop():
                         send_to_me(f"🚨 Критическое количество ошибок: {error_count}")
                     except:
                         pass
-                    # Сбрасываем счетчик
                     user_data_cache["error_count"] = 0
             except:
                 pass
             
-            # 7. Сохраняем позиции (если есть изменения)
+            # Сохранение позиций
             try:
                 save_positions_to_file()
             except Exception as e:
                 print(f"❌ Ошибка сохранения позиций: {e}")
             
-            # 8. ПРОВЕРКА БАЛАНСА (для реальной торговли)
-            if TRADING_MODE == 'real' and current_time - last_pnl_report > 600:  # Каждые 10 минут
+            # Проверка баланса
+            if TRADING_MODE == 'real' and current_time - last_pnl_report > 600:
                 try:
-                    from binance_client import binance_client
                     balance = binance_client.get_balance('USDT')
                     
-                    if balance < 50:  # Предупреждение при низком балансе
+                    if balance < 50:
                         warning_msg = f"⚠️  Низкий баланс: {balance:.2f} USDT"
                         print(warning_msg)
-                        if current_time - last_pnl_report > 1800:  # Отправляем раз в 30 минут
+                        if current_time - last_pnl_report > 1800:
                             try:
                                 send_to_me(warning_msg)
                             except:
@@ -703,24 +648,23 @@ async def monitoring_loop():
                 except:
                     pass
             
-            await asyncio.sleep(30)  # Проверка каждые 30 секунд (было 60)
+            await asyncio.sleep(30)
             
         except Exception as e:
             print(f"❌ Ошибка в цикле мониторинга: {e}")
             
-            # Увеличиваем счетчик ошибок
             try:
-                from data_store import user_data_cache
                 user_data_cache["error_count"] = user_data_cache.get("error_count", 0) + 1
             except:
                 pass
             
             await asyncio.sleep(60)
-            
+
 # ========== СИСТЕМНЫЙ ЦИКЛ ==========
+
 async def system_health_loop():
     """Цикл проверки здоровья системы"""
-    print("❤️  Запущен цикл проверки здоровья системы")
+    print("❤️  Запуск цикла проверки здоровья...")
     
     while True:
         try:
@@ -736,13 +680,14 @@ async def system_health_loop():
             cache_size = len(klines_cache)
             print(f"📊 Размер кеша данных: {cache_size} символов")
             
-            await asyncio.sleep(300)  # Проверка каждые 5 минут
+            await asyncio.sleep(300)
             
         except Exception as e:
             print(f"❌ Ошибка в цикле здоровья: {e}")
             await asyncio.sleep(60)
 
 # ========== ОСНОВНАЯ АСИНХРОННАЯ ФУНКЦИЯ ==========
+
 async def main_async():
     """Основная асинхронная функция"""
     
@@ -750,14 +695,14 @@ async def main_async():
     print("🚀 ИНИЦИАЛИЗАЦИЯ ТОРГОВОГО БОТА")
     print("=" * 60)
     
-    # Отправляем сообщение о запуске в Telegram
+    # Отправляем сообщение о запуске
     try:
         send_startup_message()
     except Exception as e:
         print(f"⚠️  Не удалось отправить стартовое сообщение: {e}")
         send_to_me("🤖 Бот запущен (упрощенное сообщение)")
     
-    # Инициализация клиента для реальной торговли
+    # Инициализация для реальной торговли
     if TRADING_MODE == 'real':
         print("\n🔐 Инициализация реального торгового режима...")
         
@@ -802,6 +747,14 @@ async def main_async():
 """
         print(warning_msg)
         send_to_me(warning_msg)
+    
+    # Проверяем баланс для реальной торговли
+    if TRADING_MODE == 'real' and not check_balance_sufficient():
+        error_msg = "❌ Недостаточно средств для торговли. Переключаю в тестовый режим."
+        print(error_msg)
+        send_to_me(error_msg)
+        # Можно добавить автоматическое переключение в dryrun
+        # TRADING_MODE = 'dryrun'
     
     # Получаем ликвидные тикеры
     print(f"\n🔍 Поиск ликвидных тикеров...")
@@ -863,18 +816,16 @@ async def main_async():
 """
     send_to_me(telegram_msg)
     
-    # Запуск торговых циклов
+    # Запуск всех циклов
     print(f"\n🔄 Запуск торговых циклов...")
     trade_tasks = [asyncio.create_task(trade_symbol_loop(sym)) for sym in top_symbols]
     
-    # Запуск цикла мониторинга
     print("👁️  Запуск цикла мониторинга...")
     monitor_task = asyncio.create_task(monitoring_loop())
     
-    # Запуск цикла здоровья системы
     print("❤️  Запуск цикла проверки здоровья...")
     health_task = asyncio.create_task(system_health_loop())
-
+    
     print("🎯 Запуск цикла мониторинга TP/SL...")
     tp_sl_task = asyncio.create_task(tp_sl_monitor_loop())
     
@@ -882,9 +833,10 @@ async def main_async():
     print("   Используйте Telegram для управления ботом")
     
     # Ожидание завершения всех задач
-    await asyncio.gather(*trade_tasks, monitor_task, health_task, tp_sl_task)
+    await asyncio.gather(*trade_tasks, monitor_task, health_task, tp_sl_task, return_exceptions=True)
 
 # ========== ЗАПУСК ПАНЕЛИ УПРАВЛЕНИЯ ==========
+
 def start_control_panel():
     """Запуск панели управления Telegram"""
     print("🎮 Запуск Telegram панели управления...")
@@ -899,12 +851,13 @@ def start_control_panel():
     start_telegram_manager()
 
 # ========== ТОЧКА ВХОДА ==========
+
 if __name__ == "__main__":
     # Запуск панели управления в отдельном потоке
     start_control_panel()
     
     # Настройки перезапуска
-    RESTART_DELAY = 10  # секунд
+    RESTART_DELAY = 10
     restart_count = 0
     max_restarts = 10
     
@@ -919,7 +872,6 @@ if __name__ == "__main__":
             
         except KeyboardInterrupt:
             print("\n\n⏹️  Остановлено пользователем")
-            print("Остановлено пользователем")
             sys.exit(0)
             
         except Exception as e:
@@ -928,7 +880,6 @@ if __name__ == "__main__":
             print(f"\n{error_msg}")
             print(f"Ошибка: {e}")
             
-            # Отправляем уведомление в Telegram
             try:
                 send_to_me(f"⚠️  {error_msg}\nОшибка: {str(e)[:100]}...")
             except:
@@ -939,8 +890,6 @@ if __name__ == "__main__":
             if restart_count >= max_restarts:
                 fatal_msg = f"❌ Достигнут лимит перезапусков ({max_restarts})"
                 print(fatal_msg)
-                print(f"Достигнут лимит перезапусков ({max_restarts})")
                 sys.exit(1)
             
-
             time.sleep(RESTART_DELAY)
